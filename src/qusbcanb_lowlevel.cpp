@@ -20,14 +20,6 @@ constexpr std::uint32_t CommandStop = 0x03;
 constexpr std::uint32_t CommandClearRxBuffer = 0x05;
 constexpr std::uint32_t CommandMessageStatus = 0x0A;
 
-constexpr std::uint8_t SendTypeNoRetry = 0x01;
-constexpr std::uint8_t SendTypeEcho = 0x02;
-
-std::uint8_t channelNumber(Channel channel)
-{
-    return channel == Channel::Can1 ? 0u : 1u;
-}
-
 std::uint32_t readLe32(const std::uint8_t *p)
 {
     return static_cast<std::uint32_t>(p[0]) |
@@ -79,8 +71,9 @@ LowLevelDevice &LowLevelDevice::operator=(LowLevelDevice &&other) noexcept
 
 bool LowLevelDevice::open(const DeviceConfig &config)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
     close();
+
+    std::lock_guard<std::mutex> lock(m_mutex);
     m_config = config;
     m_lastError.clear();
 
@@ -92,15 +85,14 @@ bool LowLevelDevice::open(const DeviceConfig &config)
 
     m_handle = libusb_open_device_with_vid_pid(m_context, config.vendor_id, config.product_id);
     if (!m_handle) {
-        setError("USB device not found: vid=0x" + std::to_string(config.vendor_id) +
-                 " pid=0x" + std::to_string(config.product_id));
+        std::ostringstream os;
+        os << "USB device not found: vid=0x" << std::hex << config.vendor_id
+           << " pid=0x" << config.product_id;
+        setError(os.str());
         libusb_exit(std::exchange(m_context, nullptr));
         return false;
     }
 
-    // Let libusb detach kernel drivers automatically where the platform supports it.
-    // This is harmless when no kernel driver is attached and avoids many
-    // LIBUSB_ERROR_BUSY cases on Linux.
     if (config.detach_kernel_driver)
         (void)libusb_set_auto_detach_kernel_driver(m_handle, 1);
 
@@ -119,16 +111,14 @@ bool LowLevelDevice::open(const DeviceConfig &config)
 
     rc = libusb_claim_interface(m_handle, config.interface_number);
     if (rc == LIBUSB_ERROR_BUSY && config.detach_kernel_driver) {
-        // One more explicit detach+claim pass helps with some CANalyst-II clones.
         (void)libusb_detach_kernel_driver(m_handle, config.interface_number);
         rc = libusb_claim_interface(m_handle, config.interface_number);
     }
+
     if (rc != LIBUSB_SUCCESS) {
         if (rc == LIBUSB_ERROR_BUSY) {
-            setError("claim interface 0 failed: LIBUSB_ERROR_BUSY. "
-                     "The USB interface is already claimed. Stop other users of the device "
-                     "first, for example old test programs, SavvyCAN/canalystii-bridge, "
-                     "python-can processes, or unplug/replug the adapter.");
+            setError("claim interface failed: LIBUSB_ERROR_BUSY. Stop other users of the adapter "
+                     "or unplug/replug it.");
         } else {
             setError("libusb_claim_interface", rc);
         }
@@ -164,46 +154,59 @@ bool LowLevelDevice::isOpen() const noexcept
     return m_handle != nullptr;
 }
 
-bool LowLevelDevice::open(void *errorOut)
+bool LowLevelDevice::init(Channel channel, const BitTiming &timing, CanMode mode)
 {
-    (void)errorOut;
-    return open(DeviceConfig{});
-}
-
-bool LowLevelDevice::reset(Channel channel)
-{
-    // There is no known dedicated reset opcode in the CANalyst-II USB protocol.
-    // For compatibility, stop the channel and clear its RX buffer.
-    (void)sendSimpleCommand(channel, CommandStop);
-    return sendSimpleCommand(channel, CommandClearRxBuffer);
-}
-
-bool LowLevelDevice::init(Channel channel, const BitTiming &timing)
-{
-    // CANalyst-II InitCommand, 16 little-endian 32-bit words:
-    // command, acc_code, acc_mask, reserved0, filter, reserved1, timing0, timing1, mode, unknown2, padding...
     std::array<std::uint8_t, UsbPacketSize> packet{};
     writeLe32(packet.data() + 0, CommandInit);
-    writeLe32(packet.data() + 4, 0x00000001u);       // acc_code: accept all with mask below
-    writeLe32(packet.data() + 8, 0xFFFFFFFFu);       // acc_mask
+    writeLe32(packet.data() + 4, 0x00000001u);       // acceptance code
+    writeLe32(packet.data() + 8, 0xFFFFFFFFu);       // acceptance mask: receive all
     writeLe32(packet.data() + 12, 0x00000000u);
-    writeLe32(packet.data() + 16, 0x00000001u);      // single-filter placeholder
+    writeLe32(packet.data() + 16, 0x00000001u);      // single filter
     writeLe32(packet.data() + 20, 0x00000000u);
     writeLe32(packet.data() + 24, timing.timing0);
     writeLe32(packet.data() + 28, timing.timing1);
-    writeLe32(packet.data() + 32, 0x00000000u);      // normal mode
+    writeLe32(packet.data() + 32, static_cast<std::uint32_t>(mode));
     writeLe32(packet.data() + 36, 0x00000001u);      // required by observed protocol
     return sendCommandPacket(channel, packet);
 }
 
 bool LowLevelDevice::start(Channel channel)
 {
-    return sendSimpleCommand(channel, CommandStart);
+    return sendCommand(channel, CommandStart);
 }
 
 bool LowLevelDevice::stop(Channel channel)
 {
-    return sendSimpleCommand(channel, CommandStop);
+    return sendCommand(channel, CommandStop);
+}
+
+bool LowLevelDevice::clearRx(Channel channel)
+{
+    const bool ok = sendCommand(channel, CommandClearRxBuffer);
+    clearRxCache(channel);
+    return ok;
+}
+
+bool LowLevelDevice::configure(Channel channel, std::uint32_t bitrate, CanMode mode)
+{
+    const BitTiming timing = bitTimingForBitrate(bitrate);
+
+    // Stop is intentionally best-effort. Some clones report errors if a channel
+    // was not started yet, but still accept INIT/START afterwards.
+    (void)stop(channel);
+    clearRxCache(channel);
+
+    if (!init(channel, timing, mode))
+        return false;
+    if (!start(channel))
+        return false;
+    return clearRx(channel);
+}
+
+bool LowLevelDevice::configureBoth(std::uint32_t bitrate, CanMode mode)
+{
+    return configure(Channel::Can1, bitrate, mode) &&
+           configure(Channel::Can2, bitrate, mode);
 }
 
 bool LowLevelDevice::send(Channel channel, const CanFrame &frame)
@@ -225,57 +228,96 @@ bool LowLevelDevice::send(Channel channel, const std::vector<CanFrame> &frames)
         for (std::size_t i = 0; i < count; ++i)
             encodeFrame(frames[offset + i], packet.data() + 1 + i * CanObjectSize);
 
-        if (!writePacketToEndpoint(endpointTxOut(channel), packet, m_config.io_timeout_ms))
+        if (!writePacket(messageEndpointOut(channel), packet, m_config.io_timeout_ms))
             return false;
         offset += count;
     }
     return true;
 }
 
-bool LowLevelDevice::receive(Channel channel, std::vector<CanFrame> &frames, std::chrono::milliseconds timeout)
+bool LowLevelDevice::receive(Channel channel,
+                             std::vector<CanFrame> &frames,
+                             std::size_t maxFrames,
+                             std::chrono::milliseconds timeout)
 {
     frames.clear();
-
-    std::uint32_t rxPending = 0;
-    std::uint32_t txPending = 0;
-    if (!readMessageStatus(channel, rxPending, txPending))
-        return false;
-    if (rxPending == 0)
+    if (maxFrames == 0)
         return true;
 
-    // The hardware returns MessageBuffer packets: 1 count byte + 3 x 21-byte messages.
-    // Read one extra packet like the known Python driver to avoid occasional USB packet
-    // fragmentation leaving the last messages for a later poll.
-    const std::uint32_t buffersToRead = std::min<std::uint32_t>((rxPending + 2u) / 3u + 1u, 64u);
+    drainRxCache(channel, frames, maxFrames);
+    if (frames.size() >= maxFrames)
+        return true;
+
+    DeviceStatus st{};
+    if (!status(channel, st))
+        return false;
+    if (st.rx_pending == 0)
+        return true;
+
+    const std::uint32_t buffersToRead = std::min<std::uint32_t>((st.rx_pending + 2u) / 3u + 1u, 64u);
     const unsigned int timeoutMs = static_cast<unsigned int>(std::max<std::int64_t>(1, timeout.count()));
+
+    std::vector<CanFrame> decoded;
+    decoded.reserve(static_cast<std::size_t>(buffersToRead) * MaxFramesPerUsbPacket);
 
     for (std::uint32_t b = 0; b < buffersToRead; ++b) {
         std::array<std::uint8_t, UsbPacketSize> packet{};
-        if (!readPacketFromEndpoint(endpointRxIn(channel), packet, timeoutMs)) {
-            // If we already decoded something, return it instead of turning a trailing
-            // empty/timeout read into a hard failure.
-            return !frames.empty();
+        if (!readPacket(messageEndpointIn(channel), packet, timeoutMs)) {
+            // Keep already decoded frames; a final short timeout can happen after
+            // the hardware has already delivered the pending messages.
+            if (!decoded.empty())
+                break;
+            return false;
         }
 
         const std::uint8_t count = std::min<std::uint8_t>(packet[0], MaxFramesPerUsbPacket);
         for (std::uint8_t i = 0; i < count; ++i) {
             CanFrame frame;
             if (decodeFrame(packet.data() + 1 + i * CanObjectSize, frame))
-                frames.push_back(frame);
+                decoded.push_back(frame);
         }
 
-        if (frames.size() >= rxPending)
+        if (decoded.size() >= st.rx_pending)
             break;
     }
+
+    if (!decoded.empty()) {
+        std::lock_guard<std::mutex> cacheLock(m_rxCacheMutex);
+        auto &queue = m_rxCache[channelIndex(channel)];
+        queue.insert(queue.end(), decoded.begin(), decoded.end());
+    }
+
+    drainRxCache(channel, frames, maxFrames);
     return true;
 }
 
-bool LowLevelDevice::writePacket(Channel channel, const std::array<std::uint8_t, UsbPacketSize> &packet, unsigned int timeout_ms)
+bool LowLevelDevice::status(Channel channel, DeviceStatus &statusOut)
 {
-    return writePacketToEndpoint(endpointCommandOut(channel), packet, timeout_ms);
+    statusOut = DeviceStatus{};
+
+    std::array<std::uint8_t, UsbPacketSize> packet{};
+    writeLe32(packet.data(), CommandMessageStatus);
+    if (!sendCommandPacket(channel, packet))
+        return false;
+
+    std::array<std::uint8_t, UsbPacketSize> response{};
+    if (!readPacket(commandEndpointIn(channel), response, m_config.io_timeout_ms))
+        return false;
+
+    statusOut.rx_pending = readLe32(response.data() + 4);
+    statusOut.tx_pending = static_cast<std::uint32_t>(response[8]) |
+                           (static_cast<std::uint32_t>(response[9]) << 8);
+    return true;
 }
 
-bool LowLevelDevice::writePacketToEndpoint(unsigned char endpoint, const std::array<std::uint8_t, UsbPacketSize> &packet, unsigned int timeout_ms)
+ChannelEndpoints LowLevelDevice::endpoints(Channel channel, const DeviceConfig &config) noexcept
+{
+    return channel == Channel::Can1 ? config.can1 : config.can2;
+}
+
+bool LowLevelDevice::writePacket(std::uint8_t endpoint,
+                                 const std::array<std::uint8_t, UsbPacketSize> &packet,
+                                 unsigned int timeout_ms)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_handle) {
@@ -298,19 +340,17 @@ bool LowLevelDevice::writePacketToEndpoint(unsigned char endpoint, const std::ar
     }
     if (transferred != static_cast<int>(packet.size())) {
         std::ostringstream os;
-        os << "short USB write on endpoint 0x" << std::hex << int(endpoint);
+        os << "short USB write on endpoint 0x" << std::hex << int(endpoint)
+           << ": transferred " << std::dec << transferred << " of " << packet.size();
         setError(os.str());
         return false;
     }
     return true;
 }
 
-bool LowLevelDevice::readPacket(Channel channel, std::array<std::uint8_t, UsbPacketSize> &packet, unsigned int timeout_ms)
-{
-    return readPacketFromEndpoint(endpointRxIn(channel), packet, timeout_ms);
-}
-
-bool LowLevelDevice::readPacketFromEndpoint(unsigned char endpoint, std::array<std::uint8_t, UsbPacketSize> &packet, unsigned int timeout_ms)
+bool LowLevelDevice::readPacket(std::uint8_t endpoint,
+                                std::array<std::uint8_t, UsbPacketSize> &packet,
+                                unsigned int timeout_ms)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_handle) {
@@ -342,63 +382,53 @@ bool LowLevelDevice::readPacketFromEndpoint(unsigned char endpoint, std::array<s
 
 bool LowLevelDevice::sendCommandPacket(Channel channel, const std::array<std::uint8_t, UsbPacketSize> &packet)
 {
-    return writePacketToEndpoint(endpointCommandOut(channel), packet, m_config.io_timeout_ms);
+    return writePacket(commandEndpointOut(channel), packet, m_config.io_timeout_ms);
 }
 
-bool LowLevelDevice::sendSimpleCommand(Channel channel, std::uint32_t command)
+bool LowLevelDevice::sendCommand(Channel channel, std::uint32_t command)
 {
     std::array<std::uint8_t, UsbPacketSize> packet{};
     writeLe32(packet.data(), command);
     return sendCommandPacket(channel, packet);
 }
 
-bool LowLevelDevice::readMessageStatus(Channel channel, std::uint32_t &rxPending, std::uint32_t &txPending)
+std::uint8_t LowLevelDevice::commandEndpointOut(Channel channel) const noexcept
 {
-    rxPending = 0;
-    txPending = 0;
-
-    std::array<std::uint8_t, UsbPacketSize> packet{};
-    writeLe32(packet.data(), CommandMessageStatus);
-    if (!sendCommandPacket(channel, packet))
-        return false;
-
-    std::array<std::uint8_t, UsbPacketSize> response{};
-    if (!readPacketFromEndpoint(endpointCommandIn(channel), response, m_config.io_timeout_ms))
-        return false;
-
-    rxPending = readLe32(response.data() + 4);
-    txPending = static_cast<std::uint32_t>(response[8]) | (static_cast<std::uint32_t>(response[9]) << 8);
-    return true;
+    return endpoints(channel, m_config).command_out;
 }
 
-unsigned char LowLevelDevice::endpointCommandOut(Channel channel) const noexcept
+std::uint8_t LowLevelDevice::commandEndpointIn(Channel channel) const noexcept
 {
-    return channel == Channel::Can1 ? m_config.command_out_can1 : m_config.command_out_can2;
+    return endpoints(channel, m_config).command_in;
 }
 
-unsigned char LowLevelDevice::endpointCommandIn(Channel channel) const noexcept
+std::uint8_t LowLevelDevice::messageEndpointOut(Channel channel) const noexcept
 {
-    return static_cast<unsigned char>(endpointCommandOut(channel) | 0x80u);
+    return endpoints(channel, m_config).message_out;
 }
 
-unsigned char LowLevelDevice::endpointTxOut(Channel channel) const noexcept
+std::uint8_t LowLevelDevice::messageEndpointIn(Channel channel) const noexcept
 {
-    return channel == Channel::Can1 ? m_config.tx_out_can1 : m_config.tx_out_can2;
+    return endpoints(channel, m_config).message_in;
 }
 
-unsigned char LowLevelDevice::endpointRxIn(Channel channel) const noexcept
+void LowLevelDevice::clearRxCache(Channel channel)
 {
-    return channel == Channel::Can1 ? m_config.rx_in_can1 : m_config.rx_in_can2;
+    std::lock_guard<std::mutex> cacheLock(m_rxCacheMutex);
+    m_rxCache[channelIndex(channel)].clear();
 }
 
-unsigned char LowLevelDevice::endpointOut(Channel channel) const noexcept
+std::size_t LowLevelDevice::drainRxCache(Channel channel, std::vector<CanFrame> &frames, std::size_t maxFrames)
 {
-    return endpointTxOut(channel);
-}
-
-unsigned char LowLevelDevice::endpointIn(Channel channel) const noexcept
-{
-    return endpointRxIn(channel);
+    std::lock_guard<std::mutex> cacheLock(m_rxCacheMutex);
+    auto &queue = m_rxCache[channelIndex(channel)];
+    const std::size_t room = maxFrames > frames.size() ? maxFrames - frames.size() : 0;
+    const std::size_t take = std::min(room, queue.size());
+    if (take > 0) {
+        frames.insert(frames.end(), queue.begin(), queue.begin() + static_cast<std::ptrdiff_t>(take));
+        queue.erase(queue.begin(), queue.begin() + static_cast<std::ptrdiff_t>(take));
+    }
+    return take;
 }
 
 void LowLevelDevice::setError(const std::string &where, int libusb_error)
@@ -411,140 +441,9 @@ void LowLevelDevice::setError(std::string message)
     m_lastError = std::move(message);
 }
 
-
-Channel LowLevelDevice::channelFromInt(int channel) noexcept
+std::size_t LowLevelDevice::channelIndex(Channel channel) noexcept
 {
-    // The Qt wrapper uses 0 = both, 1 = CAN1, 2 = CAN2.
-    // For a single-channel call, 0 and 1 therefore map to CAN1.
-    return channel <= 1 ? Channel::Can1 : Channel::Can2;
-}
-
-ChannelEndpoints LowLevelDevice::endpointsForChannel(int channel, const DeviceConfig &config)
-{
-    const bool can2 = channel > 1;
-    const unsigned char commandOut = can2 ? config.command_out_can2 : config.command_out_can1;
-    const unsigned char txOut = can2 ? config.tx_out_can2 : config.tx_out_can1;
-    const unsigned char rxIn = can2 ? config.rx_in_can2 : config.rx_in_can1;
-    const unsigned char commandIn = static_cast<unsigned char>(commandOut | 0x80u);
-
-    ChannelEndpoints ep{};
-    ep.bulk_out = txOut;
-    ep.bulk_in = rxIn;
-    ep.out = txOut;
-    ep.in = rxIn;
-    ep.tx = txOut;
-    ep.rx = rxIn;
-    ep.bulkOut = txOut;
-    ep.bulkIn = rxIn;
-    ep.outEndpoint = txOut;
-    ep.inEndpoint = rxIn;
-    ep.endpointOut = txOut;
-    ep.endpointIn = rxIn;
-    ep.commandOut = commandOut;
-    ep.commandIn = commandIn;
-    ep.txOut = txOut;
-    ep.rxIn = rxIn;
-    ep.command_out = commandOut;
-    ep.command_in = commandIn;
-    ep.tx_out = txOut;
-    ep.rx_in = rxIn;
-    return ep;
-}
-
-bool LowLevelDevice::configureAndStart(int channel, std::uint32_t bitrate, std::uint8_t mode, void *errorOut)
-{
-    (void)mode;
-    (void)errorOut;
-
-    const Channel ch = channelFromInt(channel);
-    const BitTiming timing = bitTimingForBitrate(bitrate);
-
-    // Use the observed CANalyst-II sequence: INIT then START.
-    // A fake reset command corrupts the firmware state on some clones.
-    if (!init(ch, timing))
-        return false;
-    if (!start(ch))
-        return false;
-    (void)sendSimpleCommand(ch, CommandClearRxBuffer);
-    {
-        std::lock_guard<std::mutex> cacheLock(m_rxCacheMutex);
-        m_rxCache[channelNumber(ch)].clear();
-    }
-    return true;
-}
-
-bool LowLevelDevice::configureBothAndStart(std::uint32_t bitrate, std::uint8_t mode, void *errorOut)
-{
-    (void)mode;
-    (void)errorOut;
-
-    const BitTiming timing = bitTimingForBitrate(bitrate);
-    const Channel channels[] = {Channel::Can1, Channel::Can2};
-    for (Channel ch : channels) {
-        if (!init(ch, timing))
-            return false;
-        if (!start(ch))
-            return false;
-        (void)sendSimpleCommand(ch, CommandClearRxBuffer);
-        {
-            std::lock_guard<std::mutex> cacheLock(m_rxCacheMutex);
-            m_rxCache[channelNumber(ch)].clear();
-        }
-    }
-    return true;
-}
-
-int LowLevelDevice::writeFrames(int channel, const std::vector<CanFrame> &frames, void *errorOut)
-{
-    (void)errorOut;
-    if (frames.empty())
-        return 0;
-    if (!send(channelFromInt(channel), frames))
-        return -1;
-    return static_cast<int>(frames.size());
-}
-
-FrameList LowLevelDevice::readFrames(int channel, int maxFrames, void *errorOut)
-{
-    (void)errorOut;
-    FrameList result;
-    if (maxFrames <= 0)
-        return result;
-
-    const Channel ch = channelFromInt(channel);
-    const std::size_t cacheIndex = channelNumber(ch);
-    const std::size_t wanted = static_cast<std::size_t>(maxFrames);
-
-    auto drainCache = [&]() {
-        std::lock_guard<std::mutex> cacheLock(m_rxCacheMutex);
-        auto &queue = m_rxCache[cacheIndex];
-        const std::size_t take = std::min<std::size_t>(wanted - result.size(), queue.size());
-        if (take > 0) {
-            result.insert(result.end(), queue.begin(), queue.begin() + static_cast<std::ptrdiff_t>(take));
-            queue.erase(queue.begin(), queue.begin() + static_cast<std::ptrdiff_t>(take));
-        }
-    };
-
-    // First return frames that were decoded during an earlier poll but could not
-    // be returned because older Qt code often calls readFrames(channel, 1).
-    // Without this cache, one USB packet with 3 CAN messages returned only one
-    // frame and silently discarded the other two. That produced RX~=count/3.
-    drainCache();
-    if (result.size() >= wanted)
-        return result;
-
-    std::vector<CanFrame> received;
-    if (!receive(ch, received, std::chrono::milliseconds{1}))
-        return result;
-
-    if (!received.empty()) {
-        std::lock_guard<std::mutex> cacheLock(m_rxCacheMutex);
-        auto &queue = m_rxCache[cacheIndex];
-        queue.insert(queue.end(), received.begin(), received.end());
-    }
-
-    drainCache();
-    return result;
+    return channel == Channel::Can1 ? 0u : 1u;
 }
 
 void LowLevelDevice::encodeFrame(const CanFrame &frame, std::uint8_t *dst21)
@@ -552,7 +451,7 @@ void LowLevelDevice::encodeFrame(const CanFrame &frame, std::uint8_t *dst21)
     std::memset(dst21, 0, CanObjectSize);
     writeLe32(dst21 + 0, frame.id & (frame.extended ? 0x1fffffffu : 0x7ffu));
     writeLe32(dst21 + 4, 0);                         // timestamp: ignored for TX
-    dst21[8] = 1;                                    // time_flag, matches vendor/python-can usage
+    dst21[8] = 1;                                    // time_flag
     dst21[9] = 0;                                    // send_type: normal retry, no local echo
     dst21[10] = frame.remote ? 1u : 0u;
     dst21[11] = frame.extended ? 1u : 0u;
@@ -598,6 +497,11 @@ std::string frameToCandumpString(const CanFrame &frame)
     for (std::uint8_t i = 0; i < std::min<std::uint8_t>(frame.dlc, 8); ++i)
         out << std::setw(2) << static_cast<unsigned>(frame.data[i]);
     return out.str();
+}
+
+const char *channelName(Channel channel) noexcept
+{
+    return channel == Channel::Can1 ? "CAN1" : "CAN2";
 }
 
 } // namespace qusbcanb

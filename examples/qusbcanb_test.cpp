@@ -1,131 +1,76 @@
-#include "qusbcanbusdevice.h"
-#include "qusbcanb_lowlevel.h"
+#include <qusbcanb_lowlevel.h>
 
-#include <QtCore/QCoreApplication>
-#include <QtCore/QCommandLineParser>
-#include <QtCore/QTimer>
-#include <QtCore/QDebug>
-#include <QtCore/QVariant>
+#include <cstdlib>
 #include <iostream>
+#include <string>
 
-using namespace QUsbCanB;
+namespace {
 
-static QByteArray makePayload(int seq)
+qusbcanb::Channel parseChannel(int argc, char **argv)
 {
-    QByteArray p;
-    p.append(char(0x11));
-    p.append(char(0x22));
-    p.append(char(0x33));
-    p.append(char(0x44));
-    p.append(char(seq & 0xff));
-    p.append(char(0x66));
-    p.append(char(0x77));
-    p.append(char(0x88));
-    return p;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if ((arg == "--channel" || arg == "-c") && i + 1 < argc)
+            return std::string(argv[++i]) == "2" ? qusbcanb::Channel::Can2 : qusbcanb::Channel::Can1;
+    }
+    return qusbcanb::Channel::Can1;
 }
 
-static QString dataHex(const QByteArray& data)
+bool hasFlag(int argc, char **argv, const std::string &flag)
 {
-    QString out;
-    for (unsigned char c : data)
-        out += QStringLiteral("%1 ").arg(c, 2, 16, QLatin1Char('0'));
-    return out;
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i] == flag)
+            return true;
+    }
+    return false;
 }
 
-static int lowLevelInitOnly(int channel, bool selfTest)
+} // namespace
+
+int main(int argc, char **argv)
 {
-    LowLevelDevice dev;
-    QString err;
-    if (!dev.open(&err)) {
-        std::cerr << err.toStdString() << "\n";
-        return 1;
-    }
-    const bool ok = dev.configureAndStart(channel, 125000, selfTest ? 2 : 0, &err);
-    if (!ok) {
-        std::cerr << "CAN" << channel << " init failed: " << err.toStdString() << "\n";
-        return 2;
-    }
-    std::cout << "CAN" << channel << " init/start OK\n";
-    return 0;
-}
+    const auto channel = parseChannel(argc, argv);
+    const bool selfTest = hasFlag(argc, argv, "--self-test");
+    const auto mode = selfTest ? qusbcanb::CanMode::SelfTest : qusbcanb::CanMode::Normal;
 
-int main(int argc, char** argv)
-{
-    QCoreApplication app(argc, argv);
-    qRegisterMetaType<QCanBusFrame>("QCanBusFrame");
-    qRegisterMetaType<QList<QCanBusFrame>>("QList<QCanBusFrame>");
+    const auto ep = qusbcanb::LowLevelDevice::endpoints(channel);
+    std::cout << qusbcanb::channelName(channel)
+              << ": CMD OUT 0x" << std::hex << int(ep.command_out)
+              << " CMD IN 0x" << int(ep.command_in)
+              << " MSG OUT 0x" << int(ep.message_out)
+              << " MSG IN 0x" << int(ep.message_in) << std::dec << '\n';
 
-    QCommandLineParser parser;
-    parser.setApplicationDescription("QUsbCanB v19 thread-safe Qt/QCanBusDevice test");
-    parser.addHelpOption();
-    QCommandLineOption initOnly(QStringLiteral("init-only"), QStringLiteral("Only initialize/start the selected channel."));
-    QCommandLineOption selfTest(QStringLiteral("self-test"), QStringLiteral("Use ControlCAN self-test mode 2."));
-    QCommandLineOption countOpt(QStringLiteral("count"), QStringLiteral("Frames to send."), QStringLiteral("n"), QStringLiteral("10"));
-    QCommandLineOption channelOpt(QStringLiteral("channel"), QStringLiteral("CAN channel 1 or 2."), QStringLiteral("ch"), QStringLiteral("1"));
-    parser.addOption(initOnly);
-    parser.addOption(selfTest);
-    parser.addOption(countOpt);
-    parser.addOption(channelOpt);
-    parser.process(app);
-
-    const int channel = parser.value(channelOpt).toInt() == 2 ? 2 : 1;
-    const int count = qMax(0, parser.value(countOpt).toInt());
-    const bool modeSelfTest = parser.isSet(selfTest);
-
-    const auto ep = LowLevelDevice::endpointsForChannel(channel);
-    std::cout << "QUsbCanB v19: channel=" << channel
-              << ", bitrate=125000, mode=" << (modeSelfTest ? "self-test" : "normal") << "\n";
-    std::cout << "CAN" << channel << " endpoints: CMD OUT 0x" << std::hex << int(ep.commandOut)
-              << ", TX OUT 0x" << int(ep.txOut)
-              << ", RX IN 0x" << int(ep.rxIn) << std::dec << "\n";
-
-    if (parser.isSet(initOnly))
-        return lowLevelInitOnly(channel, modeSelfTest);
-
-    QUsbCanBusDevice dev(channel);
-    dev.setConfigurationParameter(QCanBusDevice::BitRateKey, QVariant::fromValue(125000));
-    dev.setConfigurationParameter(QCanBusDevice::LoopbackKey, QVariant::fromValue(modeSelfTest));
-    dev.setPollInterval(2);
-
-    int rx = 0;
-    int written = 0;
-    QObject::connect(&dev, &QCanBusDevice::errorOccurred, [&dev](QCanBusDevice::CanBusError e) {
-        if (e != QCanBusDevice::NoError)
-            std::cerr << "QCanBus error: " << dev.errorString().toStdString() << "\n";
-    });
-    QObject::connect(&dev, &QCanBusDevice::framesWritten, [&](qint64 n) {
-        written += int(n);
-        std::cout << "framesWritten=" << n << " total=" << written << "\n";
-    });
-    QObject::connect(&dev, &QCanBusDevice::framesReceived, [&]() {
-        while (dev.framesAvailable() > 0) {
-            const QCanBusFrame f = dev.readFrame();
-            ++rx;
-            std::cout << "RX CAN" << channel
-                      << " id=0x" << std::hex << f.frameId() << std::dec
-                      << " dlc=" << f.payload().size()
-                      << " data=" << dataHex(f.payload()).toStdString() << "\n";
-        }
-    });
-    QObject::connect(&dev, &QCanBusDevice::stateChanged, [&](QCanBusDevice::CanBusDeviceState state) {
-        if (state == QCanBusDevice::ConnectedState) {
-            std::cout << "connected\n";
-            for (int i = 0; i < count; ++i) {
-                QCanBusFrame f(channel == 1 ? 0x121 : 0x122, makePayload(i));
-                dev.writeFrame(f);
-                std::cout << "TX queued seq=" << i << "\n";
-            }
-            QTimer::singleShot(1500, &app, [&]() {
-                std::cout << "summary: queued=" << count << ", written=" << written << ", rx=" << rx << "\n";
-                app.quit();
-            });
-        }
-    });
-
-    if (!dev.connectDevice()) {
-        std::cerr << "connectDevice() failed: " << dev.errorString().toStdString() << "\n";
-        return 1;
+    qusbcanb::LowLevelDevice dev;
+    if (!dev.open()) {
+        std::cerr << "open failed: " << dev.lastError() << '\n';
+        return EXIT_FAILURE;
     }
 
-    return app.exec();
+    if (!dev.configure(channel, 125000, mode)) {
+        std::cerr << "configure failed: " << dev.lastError() << '\n';
+        return EXIT_FAILURE;
+    }
+
+    qusbcanb::CanFrame frame;
+    frame.id = channel == qusbcanb::Channel::Can1 ? 0x123 : 0x321;
+    frame.dlc = 8;
+    frame.data = {0x51, 0x55, 0x53, 0x42, 0x43, 0x41, 0x4e, 0x42};
+
+    if (!dev.send(channel, frame)) {
+        std::cerr << "send failed: " << dev.lastError() << '\n';
+        return EXIT_FAILURE;
+    }
+
+    std::vector<qusbcanb::CanFrame> rx;
+    if (!dev.receive(channel, rx, 64, std::chrono::milliseconds{100})) {
+        std::cerr << "receive failed: " << dev.lastError() << '\n';
+        return EXIT_FAILURE;
+    }
+
+    std::cout << "sent 1 frame, received " << rx.size() << " frame(s) on same channel\n";
+    for (const auto &received : rx)
+        std::cout << "  " << qusbcanb::frameToCandumpString(received) << '\n';
+
+    (void)dev.stop(channel);
+    return EXIT_SUCCESS;
 }

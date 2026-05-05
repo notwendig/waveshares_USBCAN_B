@@ -1,0 +1,10 @@
+prefix=@QUSBCANB_LOWLEVEL_INSTALL_DIR@
+libdir=${prefix}
+includedir=${prefix}/include
+
+Name: qusbcanb_lowlevel
+Description: Qt-free POSIX/libusb low-level backend for Waveshare USBCAN-B / CANalyst-II compatible devices
+Version: @PROJECT_VERSION@
+Requires.private: libusb-1.0
+Libs: -L${libdir} -lqusbcanb_lowlevel
+Cflags: -I${includedir}
