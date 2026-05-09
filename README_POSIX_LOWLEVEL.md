@@ -16,7 +16,7 @@ Installed layout:
 ```text
 ~/lib/libqusbcanb_lowlevel.so
 ~/lib/libqusbcanb_lowlevel.so.0
-~/lib/libqusbcanb_lowlevel.so.0.15.0
+~/lib/libqusbcanb_lowlevel.so.0.16.0
 ~/lib/libqusbcanb_lowlevel.a
 ~/lib/include/qusbcanb_lowlevel.h
 ~/lib/pkgconfig/qusbcanb_lowlevel.pc
@@ -26,34 +26,12 @@ Installed layout:
 
 From the project root:
 
-```bash
-cd ~/Projects/Qt/qtwaveshare_usbcan
-unzip -o ~/Downloads/QUsbCanB_POSIX_lowlevel_v15_separate_lib_install.zip
-./unzip-build.sh
-```
-
-The script performs:
-
-```bash
 rm -rf build
 cmake -S . -B build -DQUSBCANB_LOWLEVEL_INSTALL_DIR="$HOME/lib"
 cmake --build build -j
 cmake --install build --component lowlevel
 ./build/qusbcanb_regression --count 1
 ./build/qusbcanb_regression --count 100
-```
-
-Custom install directory:
-
-```bash
-./unzip-build.sh --install-dir ~/lib
-```
-
-Build/install without running hardware tests:
-
-```bash
-./unzip-build.sh --no-tests
-```
 
 ## LowLevel interface
 
@@ -126,4 +104,4 @@ CAN1: CMD OUT 0x02, CMD IN 0x82, MSG OUT 0x01, MSG IN 0x81
 CAN2: CMD OUT 0x04, CMD IN 0x84, MSG OUT 0x03, MSG IN 0x83
 ```
 
-This is the layout that passed the cross-channel regression test on the connected CAN1 <-> CAN2 setup.
+This is the layout that passed the cross-channel reression test on the connected CAN1 <-> CAN2 setup.

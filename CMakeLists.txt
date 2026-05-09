@@ -1,11 +1,12 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(QUsbCanB VERSION 0.15.0 LANGUAGES CXX)
+project(QUsbCanB VERSION 0.16.0 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_VERBOSE_MAKEFILE ON)
 
 include(GNUInstallDirs)
 
@@ -25,7 +26,7 @@ endif()
 # Qt-free POSIX/libusb low-level backend
 # -----------------------------------------------------------------------------
 add_library(QUsbCanBLowLevelObjects OBJECT
-    src/qusbcanb_lowlevel.cpp
+    src/qusbcanb_lowlevel.h src/qusbcanb_lowlevel.cpp
 )
 target_include_directories(QUsbCanBLowLevelObjects
     PUBLIC
